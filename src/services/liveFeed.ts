@@ -16,10 +16,30 @@ let reconnectDelay = 1000;
 let proactiveReconnectTimeout: NodeJS.Timeout | null = null;
 let isShuttingDown = false;
 
+export function getBybitSymbol(symbol: string): string {
+  const memeCoinsWith1000Bybit = [
+    'PEPEUSDT',
+    'BONKUSDT',
+    'FLOKIUSDT',
+    'BRETTUSDT',
+    'TURBOUSDT',
+    'MEMEUSDT',
+    'POPCATUSDT',
+    'HMSTRUSDT',
+    'CATIUSDT',
+    'MEWUSDT',
+    'BOMEUSDT',
+  ];
+  const upper = symbol.toUpperCase();
+  if (memeCoinsWith1000Bybit.includes(upper)) {
+    return `1000${upper}`;
+  }
+  return upper;
+}
+
 export function getLivePrice(symbol: string): LivePriceData | null {
   const cached = livePriceCache.get(symbol);
   if (!cached) return null;
-  // If the cache is older than 10 seconds, treat it as stale/stuck
   if (Date.now() - cached.lastUpdated > 10000) {
     return null;
   }
@@ -34,23 +54,35 @@ export function getAllLivePrices(): LivePriceData[] {
 export function startLiveFeed() {
   if (isShuttingDown) return;
 
-  console.log('[WebSocket] Initializing single-connection Binance combined streams feed...');
-
-  // Build the combined stream query parameter
-  const streams = FIXED_TRADE_PAIRS.map(
-    symbol => `${symbol.toLowerCase()}@bookTicker/${symbol.toLowerCase()}@markPrice@1s`
-  ).join('/');
-
-  const wsUrl = `wss://fstream.binance.com/stream?streams=${streams}`;
+  console.log('[WebSocket] Initializing Bybit Linear USDT Perpetual WebSocket...');
+  // Bybit WebSocket subscriptions must be UPPERCASE and use 1000-prefix for meme coins
+  const symbols = FIXED_TRADE_PAIRS.map(pair => getBybitSymbol(pair).toUpperCase());
 
   try {
-    ws = new WebSocket(wsUrl);
+    ws = new WebSocket('wss://stream.bybit.com/v5/public/linear');
 
     ws.on('open', () => {
-      console.log('[WebSocket] Successfully connected to Binance Combined Streams.');
-      reconnectDelay = 1000; // Reset exponential backoff on success
+      console.log('[WebSocket] Connected to Bybit Linear USDT. Subscribing to channels...');
+      reconnectDelay = 1000;
 
-      // Schedule proactive reconnect in 23.5 hours
+      const subscriptions = [];
+      
+      for (const symbol of symbols) {
+        subscriptions.push({ op: 'subscribe', args: [`tickers.${symbol}`] });
+      }
+      
+      for (const symbol of symbols) {
+        subscriptions.push({ op: 'subscribe', args: [`orderbook.50.${symbol}`] });
+      }
+      
+      for (const symbol of symbols) {
+        subscriptions.push({ op: 'subscribe', args: [`publicTrade.${symbol}`] });
+      }
+
+      subscriptions.forEach(sub => {
+        ws?.send(JSON.stringify(sub));
+      });
+
       if (proactiveReconnectTimeout) clearTimeout(proactiveReconnectTimeout);
       proactiveReconnectTimeout = setTimeout(() => {
         console.log('[WebSocket] Performing proactive 23.5-hour scheduled reconnection...');
@@ -63,9 +95,20 @@ export function startLiveFeed() {
         const raw = messageData.toString();
         const msg = JSON.parse(raw);
 
-        if (msg.stream && msg.data) {
+        if (msg.op === 'subscribe' || msg.op === 'pong') {
+          return;
+        }
+
+        if (msg.topic && msg.data) {
+          const topic = msg.topic;
           const data = msg.data;
-          const symbol = data.s; // e.g. "BTCUSDT"
+
+          // Support alphanumeric symbols like AI16ZUSDT and leading multiplier numbers like 1000PEPEUSDT
+          const symbolMatch = topic.match(/([A-Z0-9]+USDT)/);
+          if (!symbolMatch) return;
+
+          let symbol = symbolMatch[1];
+          symbol = symbol.replace(/^\d+/, ''); // Remove multiplier prefix to map back to our internal symbol (e.g. 1000PEPEUSDT -> PEPEUSDT)
           let cached = livePriceCache.get(symbol);
           if (!cached) {
             cached = {
@@ -77,17 +120,25 @@ export function startLiveFeed() {
             };
           }
 
-          if (msg.stream.endsWith('@bookTicker')) {
-            cached.bidPrice = parseFloat(data.b);
-            cached.askPrice = parseFloat(data.a);
-            if (cached.markPrice === 0) {
+          if (topic.startsWith('tickers.')) {
+            cached.bidPrice = parseFloat(data.bidPrice || data.bid1Price || 0);
+            cached.askPrice = parseFloat(data.askPrice || data.ask1Price || 0);
+            cached.markPrice = parseFloat(data.markPrice || data.lastPrice || 0);
+          } 
+          else if (topic.startsWith('orderbook.')) {
+            if (data.b && data.b.length > 0) {
+              cached.bidPrice = parseFloat(data.b[0][0]);
+            }
+            if (data.a && data.a.length > 0) {
+              cached.askPrice = parseFloat(data.a[0][0]);
+            }
+            if (!cached.markPrice || cached.markPrice === 0) {
               cached.markPrice = (cached.bidPrice + cached.askPrice) / 2;
             }
-          } else if (msg.stream.endsWith('@markPrice@1s')) {
-            cached.markPrice = parseFloat(data.p);
-            if (cached.bidPrice === 0) {
-              cached.bidPrice = cached.markPrice;
-              cached.askPrice = cached.markPrice;
+          } 
+          else if (topic.startsWith('publicTrade.')) {
+            if (data.p && (!cached.markPrice || cached.markPrice === 0)) {
+              cached.markPrice = parseFloat(data.p);
             }
           }
 
@@ -95,27 +146,28 @@ export function startLiveFeed() {
           livePriceCache.set(symbol, cached);
         }
       } catch (err) {
-        // Suppress tick parsing noise to prevent console flooding
+        if ((err as any).message?.includes('JSON')) {
+          return;
+        }
       }
     });
 
-    ws.on('ping', () => {
-      ws?.pong();
+    ws.on('ping', (data) => {
+      ws?.pong(data);
     });
 
     ws.on('close', (code, reason) => {
       if (isShuttingDown) return;
-      console.log(`[WebSocket] Connection closed (Code: ${code}, Reason: ${reason}). Reconnecting...`);
+      console.log(`[WebSocket] Bybit connection closed. Reconnecting...`);
       scheduleReconnect();
     });
 
     ws.on('error', (err) => {
-      console.error('[WebSocket] Error occurred on connection:', err.message);
-      // Let 'close' handler handle the reconnection
+      console.error('[WebSocket] Bybit error:', err.message);
     });
 
   } catch (err: any) {
-    console.error('[WebSocket] Failed to establish connection:', err.message);
+    console.error('[WebSocket] Failed to connect to Bybit:', err.message);
     scheduleReconnect();
   }
 }
@@ -123,9 +175,9 @@ export function startLiveFeed() {
 function scheduleReconnect() {
   if (proactiveReconnectTimeout) clearTimeout(proactiveReconnectTimeout);
   setTimeout(() => {
-    console.log(`[WebSocket] Attempting connection retry (delay: ${reconnectDelay}ms)...`);
+    console.log(`[WebSocket] Reconnecting (delay: ${reconnectDelay}ms)...`);
     startLiveFeed();
-    reconnectDelay = Math.min(reconnectDelay * 2, 60000); // Caps at 1 minute
+    reconnectDelay = Math.min(reconnectDelay * 2, 60000);
   }, reconnectDelay);
 }
 
@@ -136,7 +188,7 @@ export function stopLiveFeed() {
     try {
       ws.close();
     } catch (err) {
-      // Ignore closing errors
+      // Ignore
     }
   }
 }

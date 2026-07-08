@@ -5,7 +5,6 @@ import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import pino from 'pino';
 import { z } from 'zod';
-import { parseEnv } from 'znv';
 import rateLimit from 'express-rate-limit';
 import NodeCache from 'node-cache';
 import * as Sentry from '@sentry/node';
@@ -17,13 +16,15 @@ const logger = pino({
   },
 });
 
-// Environment variable validation using znv
-const env = parseEnv(process.env, {
-  GEMINI_API_KEY: z.string().optional().default(''),
+// Environment variable validation using native Zod
+const envSchema = z.object({
+  GEMINI_API_KEY: z.string().default(''),
   PORT: z.coerce.number().default(3000),
   NODE_ENV: z.enum(['dev', 'prod', 'development', 'production']).default('dev'),
-  SENTRY_DSN: z.string().optional().default(''),
+  SENTRY_DSN: z.string().default(''),
 });
+
+const env = envSchema.parse(process.env);
 
 // Initialize Sentry for error tracking if SENTRY_DSN is provided
 if (env.SENTRY_DSN) {
@@ -375,32 +376,128 @@ async function fetchBinanceWithRetry(url: string, retries = 3, delayMs = 2000): 
   return binanceQueue.enqueue(url, retries, delayMs);
 }
 
+function getBybitSymbol(symbol: string): string {
+  const memeCoinsWith1000Bybit = [
+    'PEPEUSDT',
+    'BONKUSDT',
+    'FLOKIUSDT',
+    'BRETTUSDT',
+    'TURBOUSDT',
+    'MEMEUSDT',
+    'POPCATUSDT',
+    'HMSTRUSDT',
+    'CATIUSDT',
+    'MEWUSDT',
+    'BOMEUSDT',
+  ];
+  const upper = symbol.toUpperCase();
+  if (memeCoinsWith1000Bybit.includes(upper)) {
+    return `1000${upper}`;
+  }
+  return upper;
+}
+
+function getBinanceSymbol(symbol: string): string {
+  const memeCoinsWith1000Binance = [
+    'PEPEUSDT',
+    'BONKUSDT',
+    'FLOKIUSDT',
+    'BRETTUSDT',
+    'TURBOUSDT',
+    'HMSTRUSDT',
+    'CATIUSDT',
+    'MEWUSDT',
+    'BOMEUSDT',
+  ];
+  const upper = symbol.toUpperCase();
+  if (memeCoinsWith1000Binance.includes(upper)) {
+    return `1000${upper}`;
+  }
+  return upper;
+}
+
 /**
  * 1D Klines Loader: Cache and refresh once every 60 minutes
  */
+// Updated for Bybit V5 API
 async function getCachedKlines1D(symbol: string): Promise<any> {
   const now = Date.now();
   const cached = klines1DCache[symbol];
   if (cached && (now - cached.timestamp < 60 * 60 * 1000)) {
     return cached.data;
   }
-  const data = await fetchBinanceWithRetry(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1d&limit=250`);
-  klines1DCache[symbol] = { timestamp: now, data };
-  return data;
+
+  try {
+    const bybitSymbol = getBybitSymbol(symbol);
+    const response = await fetch(
+      `https://api.bybit.com/v5/market/kline?category=linear&symbol=${bybitSymbol}&interval=D&limit=250`
+    );
+    if (!response.ok) throw new Error(`Bybit API error: ${response.status}`);
+
+    const data = await response.json();
+    const klines = data.result?.list || [];
+    
+    // Bybit returns newest first (descending). Reverse to oldest first (ascending) to match Binance and allow indicator calculations.
+    klines.reverse();
+    
+    const formatted = klines.map((k: any) => [
+      k[0], // openTime (string/number)
+      k[1], // open (string)
+      k[2], // high (string)
+      k[3], // low (string)
+      k[4], // close (string)
+      k[5], // volume (string)
+      parseInt(k[0]) + 24 * 60 * 60 * 1000, // closeTime
+      k[6], // turnover
+      '0', '0', '0', '0'
+    ]);
+
+    klines1DCache[symbol] = { timestamp: now, data: formatted };
+    return formatted;
+  } catch (err: any) {
+    logger.error(err, `Failed to fetch D1 klines for ${symbol}`);
+    return [];
+  }
 }
 
-/**
- * 4H Klines Loader: Cache and refresh once every 30 minutes
- */
 async function getCachedKlines4H(symbol: string): Promise<any> {
   const now = Date.now();
   const cached = klines4HCache[symbol];
   if (cached && (now - cached.timestamp < 30 * 60 * 1000)) {
     return cached.data;
   }
-  const data = await fetchBinanceWithRetry(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=4h&limit=250`);
-  klines4HCache[symbol] = { timestamp: now, data };
-  return data;
+
+  try {
+    const bybitSymbol = getBybitSymbol(symbol);
+    const response = await fetch(
+      `https://api.bybit.com/v5/market/kline?category=linear&symbol=${bybitSymbol}&interval=240&limit=250`
+    );
+    if (!response.ok) throw new Error(`Bybit API error: ${response.status}`);
+
+    const data = await response.json();
+    const klines = data.result?.list || [];
+
+    // Bybit returns newest first (descending). Reverse to oldest first (ascending) to match Binance and allow indicator calculations.
+    klines.reverse();
+
+    const formatted = klines.map((k: any) => [
+      k[0], // openTime
+      k[1], // open
+      k[2], // high
+      k[3], // low
+      k[4], // close
+      k[5], // volume
+      parseInt(k[0]) + 4 * 60 * 60 * 1000, // closeTime
+      k[6], // turnover
+      '0', '0', '0', '0'
+    ]);
+
+    klines4HCache[symbol] = { timestamp: now, data: formatted };
+    return formatted;
+  } catch (err: any) {
+    logger.error(err, `Failed to fetch 4H klines for ${symbol}`);
+    return [];
+  }
 }
 
 const app = express();
@@ -667,8 +764,9 @@ async function updatePendingSignals() {
       const signalId = docSnap.id;
 
       try {
+        const binanceSymbol = getBinanceSymbol(signal.coin);
         const response = await fetch(
-          `https://fapi.binance.com/fapi/v1/klines?symbol=${signal.coin}&interval=15m&startTime=${signal.timestamp}&limit=100`
+          `https://fapi.binance.com/fapi/v1/klines?symbol=${binanceSymbol}&interval=15m&startTime=${signal.timestamp}&limit=100`
         );
         if (!response.ok) {
           console.warn(`[Outcome Tracker] Failed to fetch klines for ${signal.coin}. Status: ${response.status}`);
@@ -832,7 +930,8 @@ async function runMarketScan(): Promise<Signal[]> {
           }
 
           // Fetch 15M klines (limit=250) - polling freshly each scan cycle with retry and rate check
-          const m15Klines = await fetchBinanceWithRetry(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=15m&limit=250`);
+          const binanceSymbol = getBinanceSymbol(symbol);
+          const m15Klines = await fetchBinanceWithRetry(`https://fapi.binance.com/fapi/v1/klines?symbol=${binanceSymbol}&interval=15m&limit=250`);
           if (m15Klines.length < 30) {
             console.log(`[DEBUG-SERVER] Skip ${symbol}: Klines 15M kurang dari 30 (ada ${m15Klines.length})`);
             return;
@@ -864,7 +963,7 @@ async function runMarketScan(): Promise<Signal[]> {
           const spread = ((askPrice - bidPrice) / bidPrice) * 100;
           let bidAskRatio = 1.0;
           try {
-            const depth = await fetchBinanceWithRetry(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=20`);
+            const depth = await fetchBinanceWithRetry(`https://fapi.binance.com/fapi/v1/depth?symbol=${binanceSymbol}&limit=20`);
             if (depth && depth.bids) {
               const bidSum = depth.bids.reduce((sum: number, b: any) => sum + parseFloat(b[1]), 0);
               const askSum = depth.asks.reduce((sum: number, a: any) => sum + parseFloat(a[1]), 0);
@@ -1208,7 +1307,7 @@ async function runMarketScan(): Promise<Signal[]> {
           let openInterestChange = 0.0;
 
           try {
-            const oiHistRes = await fetch(`https://fapi.binance.com/fapi/v1/openInterestHist?symbol=${symbol}&period=15m&limit=5`);
+            const oiHistRes = await fetch(`https://fapi.binance.com/fapi/v1/openInterestHist?symbol=${binanceSymbol}&period=15m&limit=5`);
             if (oiHistRes.ok) {
               const oiHist = await oiHistRes.json();
               if (oiHist.length >= 2) {

@@ -64,22 +64,38 @@ export function ema(values: number[], length: number) {
 
 export function rsi(values: number[], length = 14) {
   if (values.length <= length) return null;
-  let gains = 0, losses = 0;
+
+  let gains = 0;
+  let losses = 0;
+  
   for (let i = 1; i <= length; i++) {
-    const delta = values[values.length - i] - values[values.length - i - 1];
-    if (delta > 0) gains += delta; else losses -= Math.min(delta, 0);
+    const delta = values[i] - values[i - 1];
+    if (delta > 0) {
+      gains += delta;
+    } else {
+      losses += Math.abs(delta);
+    }
   }
+
   let avgGain = gains / length;
   let avgLoss = losses / length;
-  // Wilder smoothing for subsequent values
-  for (let i = values.length - length - 1; i >= 1; i--) {
+
+  // FIXED: Forward iteration for Wilder's smoothing (was backward before!)
+  for (let i = length + 1; i < values.length; i++) {
     const delta = values[i] - values[i - 1];
-    avgGain = (avgGain * (length - 1) + Math.max(delta, 0)) / length;
-    avgLoss = (avgLoss * (length - 1) + Math.max(-delta, 0)) / length;
+    const gain = delta > 0 ? delta : 0;
+    const loss = delta < 0 ? Math.abs(delta) : 0;
+
+    avgGain = (avgGain * (length - 1) + gain) / length;
+    avgLoss = (avgLoss * (length - 1) + loss) / length;
   }
-  if (avgLoss === 0) return 100;
+
+  if (avgLoss === 0) {
+    return avgGain > 0 ? 100 : 0;
+  }
+
   const rs = avgGain / avgLoss;
-  return 100 - 100 / (1 + rs);
+  return 100 - (100 / (1 + rs));
 }
 
 export function atr(candles: Candle[], length = 14) {
@@ -207,6 +223,43 @@ export function whaleDetected(trades: Trade[], thresholdQuote = 50000) { // e.g.
   return false;
 }
 
+/**
+ * FIXED: Proper confidence calculation per specification
+ * D1 Trend (25) + H4 Momentum (25) + M15 Entry (30) + OrderFlow (20) = 100 max
+ */
+function calculateConfidence(scores: {
+  d1Trend: number;
+  h4Momentum: number;
+  m15Entry: number;
+  orderflowScore: number;
+  conflictingSignals: number;
+  volumeSpikeConfirmed: boolean;
+}): { confidence: number; reasons: string[] } {
+  const reasons: string[] = [];
+  
+  // Positive contributions only
+  const positive = 
+    Math.max(0, scores.d1Trend) +
+    Math.max(0, scores.h4Momentum) +
+    Math.max(0, scores.m15Entry) +
+    Math.max(0, scores.orderflowScore);
+
+  // Penalty for conflicts (-15 per opposing signal)
+  const conflictPenalty = scores.conflictingSignals * 15;
+
+  // Volume spike penalty (-20 if missing on bullish setup)
+  const volumePenalty = positive > 0 && !scores.volumeSpikeConfirmed ? 20 : 0;
+
+  let confidence = Math.max(0, Math.min(100, positive - conflictPenalty - volumePenalty));
+
+  reasons.push(`Breakdown: D1=${Math.max(0, scores.d1Trend)}pt + H4=${Math.max(0, scores.h4Momentum)}pt + M15=${Math.max(0, scores.m15Entry)}pt + OF=${Math.max(0, scores.orderflowScore)}pt = ${positive}`);
+  if (conflictPenalty > 0) reasons.push(`Conflict penalty: -${conflictPenalty}`);
+  if (volumePenalty > 0) reasons.push(`Volume spike penalty: -${volumePenalty}`);
+  reasons.push(`Final Confidence: ${confidence.toFixed(0)}/100`);
+
+  return { confidence, reasons };
+}
+
 /* ------------------------ Core evaluation ------------------------ */
 export function evaluatePair(input: EvaluateInput): EvaluateResult {
   const { pair, d1, h4, m15, orderbook, trades, tickers } = input;
@@ -305,23 +358,6 @@ export function evaluatePair(input: EvaluateInput): EvaluateResult {
     reasons.push('Volume Spike Filter: PASS');
   }
 
-  // Sum scores into confidence
-  // mapping per your formula:
-  // D1 Trend = 25, H4 Momentum = 25, M15 Entry = 30, Order Flow = 20 (total 100)
-  const scoreBreakdown = {
-    d1Trend: d1Score,
-    h4Momentum: h4Score,
-    m15Entry: m15Score,
-    orderflow: orderflowScore,
-  };
-  const rawScore = (d1Score > 0 ? d1Score : 0) + (h4Score > 0 ? h4Score : 0) + (Math.abs(m15Score) === 30 && m15Score > 0 ? m15Score : (m15Score < 0 ? Math.abs(m15Score) : 0)) + (orderflowScore > 0 ? orderflowScore : 0);
-  // But we must handle negative signals: compute confidence as positive contribution proportion of 100 then subtract negatives
-  const positive = Math.max(0, d1Score) + Math.max(0, h4Score) + Math.max(0, m15Score) + Math.max(0, orderflowScore);
-  const negative = Math.abs(Math.min(0, d1Score)) + Math.abs(Math.min(0, h4Score)) + Math.abs(Math.min(0, m15Score)) + Math.abs(Math.min(0, orderflowScore));
-  let confidence = Math.round(((positive - negative) / 100) * 100);
-  if (confidence < 0) confidence = 0;
-  if (confidence > 100) confidence = 100;
-
   // Direction decision rules and ELITE trigger rules
   // Determine direction by signs of D1 and H4 and M15 entry + orderflow
   let direction: SignalDirection = 'NONE';
@@ -334,6 +370,40 @@ export function evaluatePair(input: EvaluateInput): EvaluateResult {
   if (sumSigns > 0) direction = 'LONG';
   else if (sumSigns < 0) direction = 'SHORT';
   else direction = 'NONE';
+
+  // Sum scores into confidence
+  // mapping per your formula:
+  // D1 Trend = 25, H4 Momentum = 25, M15 Entry = 30, Order Flow = 20 (total 100)
+  const scoreBreakdown = {
+    d1Trend: d1Score,
+    h4Momentum: h4Score,
+    m15Entry: m15Score,
+    orderflow: orderflowScore,
+  };
+
+  // Identify conflicts: if overall direction is LONG, any negative signal is a conflict. If overall direction is SHORT, any positive signal is a conflict.
+  let conflictingSignals = 0;
+  if (direction === 'LONG') {
+    if (d1Score < 0) conflictingSignals++;
+    if (h4Score < 0) conflictingSignals++;
+    if (m15Score < 0) conflictingSignals++;
+    if (orderflowScore < 0) conflictingSignals++;
+  } else if (direction === 'SHORT') {
+    if (d1Score > 0) conflictingSignals++;
+    if (h4Score > 0) conflictingSignals++;
+    if (m15Score > 0) conflictingSignals++;
+    if (orderflowScore > 0) conflictingSignals++;
+  }
+
+  const { confidence, reasons: confidenceReasons } = calculateConfidence({
+    d1Trend: d1Score,
+    h4Momentum: h4Score,
+    m15Entry: m15Score,
+    orderflowScore,
+    conflictingSignals,
+    volumeSpikeConfirmed: volSpikePass,
+  });
+  reasons.push(...confidenceReasons);
 
   // Grade by mapping
   let grade: EvaluateResult['grade'] = 'WAIT';
