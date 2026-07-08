@@ -1,0 +1,6 @@
+{
+  "name": "CRYPTO SCALPER SIGNAL AI",
+  "description": "Dashboard analisis signal trading crypto futures perpetual untuk kegunaan edukasi dan analisis sahaja.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
