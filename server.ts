@@ -3,6 +3,54 @@ import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
+import pino from 'pino';
+import { z } from 'zod';
+import { parseEnv } from 'znv';
+import rateLimit from 'express-rate-limit';
+import NodeCache from 'node-cache';
+import * as Sentry from '@sentry/node';
+
+const logger = pino({
+  level: process.env.LOG_LEVEL || 'info',
+  transport: {
+    target: 'pino-pretty',
+  },
+});
+
+// Environment variable validation using znv
+const env = parseEnv(process.env, {
+  GEMINI_API_KEY: z.string().optional().default(''),
+  PORT: z.coerce.number().default(3000),
+  NODE_ENV: z.enum(['dev', 'prod', 'development', 'production']).default('dev'),
+  SENTRY_DSN: z.string().optional().default(''),
+});
+
+// Initialize Sentry for error tracking if SENTRY_DSN is provided
+if (env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: env.SENTRY_DSN as string,
+    environment: env.NODE_ENV as string,
+  });
+  logger.info('Sentry error tracking initialized.');
+}
+
+const SignalSchema = z.object({
+  coin: z.string().min(1),
+  direction: z.enum(['LONG', 'SHORT']),
+  score: z.number().min(0).max(100),
+  entryPrice: z.number().positive(),
+});
+
+// Cache engine with standard TTL (600 seconds)
+const appCache = new NodeCache({ stdTTL: 600 });
+
+// Helper to clear caches
+function clearCaches() {
+  appCache.del('signals');
+  appCache.del('performance');
+  appCache.del('historical-logs');
+  logger.info('Cache cleared successfully.');
+}
 
 // ==========================================
 // RESILIENT LOCAL JSON DATABASE (FIREBASE ALTERNATIVE)
@@ -227,10 +275,54 @@ const nonExistentSymbols = new Set<string>();
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * In-memory resilient Binance request queue to prevent 429/418 rate limiting.
+ */
+class BinanceRequestQueue {
+  private queue: Array<{
+    url: string;
+    retries: number;
+    delayMs: number;
+    resolve: (val: any) => void;
+    reject: (err: any) => void;
+  }> = [];
+  private activeCount = 0;
+  private maxConcurrency = 3;
+
+  async enqueue(url: string, retries = 3, delayMs = 2000): Promise<any> {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ url, retries, delayMs, resolve, reject });
+      this.process();
+    });
+  }
+
+  private async process() {
+    if (this.activeCount >= this.maxConcurrency || this.queue.length === 0) {
+      return;
+    }
+
+    const task = this.queue.shift();
+    if (!task) return;
+
+    this.activeCount++;
+    try {
+      const res = await fetchBinanceWithRetryDirect(task.url, task.retries, task.delayMs);
+      task.resolve(res);
+    } catch (err) {
+      task.reject(err);
+    } finally {
+      this.activeCount--;
+      this.process();
+    }
+  }
+}
+
+const binanceQueue = new BinanceRequestQueue();
+
+/**
  * Robust fetch with exponential backoff for Binance API 429/418/Network errors,
  * plus rate-limiting governor checking X-MBX-USED-WEIGHT-1M.
  */
-async function fetchBinanceWithRetry(url: string, retries = 3, delayMs = 2000): Promise<any> {
+async function fetchBinanceWithRetryDirect(url: string, retries = 3, delayMs = 2000): Promise<any> {
   try {
     const res = await fetch(url);
 
@@ -239,7 +331,7 @@ async function fetchBinanceWithRetry(url: string, retries = 3, delayMs = 2000): 
     if (weightHeader) {
       const currentWeight = parseInt(weightHeader, 10);
       if (currentWeight > 1920) { // 80% of 2400 is 1920
-        console.warn(`[Binance Rate Limit Governor] Used weight is high: ${currentWeight}/2400. Adding protective delay of 2000ms.`);
+        logger.warn(`[Binance Rate Limit Governor] Used weight is high: ${currentWeight}/2400. Adding protective delay of 2000ms.`);
         await sleep(2000);
       }
     }
@@ -253,9 +345,9 @@ async function fetchBinanceWithRetry(url: string, retries = 3, delayMs = 2000): 
 
     if (res.status === 429 || res.status === 418) {
       if (retries > 1) {
-        console.warn(`[Binance Limit Error] Received HTTP ${res.status}. Retrying in ${delayMs}ms... (${retries - 1} retries left)`);
+        logger.warn(`[Binance Limit Error] Received HTTP ${res.status}. Retrying in ${delayMs}ms... (${retries - 1} retries left)`);
         await sleep(delayMs);
-        return fetchBinanceWithRetry(url, retries - 1, delayMs * 2);
+        return fetchBinanceWithRetryDirect(url, retries - 1, delayMs * 2);
       } else {
         throw new Error(`Binance returned persistent rate limit status: ${res.status}`);
       }
@@ -271,12 +363,16 @@ async function fetchBinanceWithRetry(url: string, retries = 3, delayMs = 2000): 
       throw err;
     }
     if (retries > 1) {
-      console.warn(`[Binance Fetch Error] ${err.message}. Retrying in ${delayMs}ms... (${retries - 1} retries left)`);
+      logger.warn(`[Binance Fetch Error] ${err.message}. Retrying in ${delayMs}ms... (${retries - 1} retries left)`);
       await sleep(delayMs);
-      return fetchBinanceWithRetry(url, retries - 1, delayMs * 2);
+      return fetchBinanceWithRetryDirect(url, retries - 1, delayMs * 2);
     }
     throw err;
   }
+}
+
+async function fetchBinanceWithRetry(url: string, retries = 3, delayMs = 2000): Promise<any> {
+  return binanceQueue.enqueue(url, retries, delayMs);
 }
 
 /**
@@ -309,6 +405,22 @@ async function getCachedKlines4H(symbol: string): Promise<any> {
 
 const app = express();
 app.use(express.json());
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Terlalu banyak permintaan dari IP ini. Sila cuba lagi selepas 15 minit.' },
+});
+
+app.use('/api/', (req, res, next) => {
+  if (req.path === '/live-prices/stream') {
+    return next();
+  }
+  return limiter(req, res, next);
+});
+
 const PORT = 3000;
 
 // Global Cooldown and Settings Store
@@ -548,6 +660,8 @@ async function updatePendingSignals() {
       return;
     }
 
+    let hasChanges = false;
+
     for (const docSnap of querySnapshot.docs) {
       const signal = docSnap.data() as Signal;
       const signalId = docSnap.id;
@@ -619,11 +733,16 @@ async function updatePendingSignals() {
             outcome,
             outcomeTimestamp: outcomeTime,
           });
+          hasChanges = true;
           console.log(`[Outcome Tracker] Resolved Signal ${signalId} (${signal.coin}) -> ${outcome}`);
         }
       } catch (err) {
         console.error(`[Outcome Tracker] Error checking signal ${signalId}:`, err);
       }
+    }
+
+    if (hasChanges) {
+      clearCaches();
     }
   } catch (err) {
     console.error('[Outcome Tracker] Error scanning pending signals:', err);
@@ -1224,8 +1343,18 @@ async function runMarketScan(): Promise<Signal[]> {
           };
 
           if (finalScore >= settings.minScore) {
-            console.log(`[DEBUG-SERVER] SUCCESS ${symbol}: Lulus semua tapisan dengan Score ${finalScore} >= ${settings.minScore}! Isyarat diletakkan ke dalam senarai.`);
-            validSignals.push(signalData);
+            const validation = SignalSchema.safeParse({
+              coin: signalData.coin,
+              direction: signalData.direction,
+              score: signalData.score,
+              entryPrice: signalData.entryPrice,
+            });
+            if (validation.success) {
+              logger.info({ symbol, score: finalScore }, 'Signal qualified');
+              validSignals.push(signalData);
+            } else {
+              logger.error({ error: validation.error, symbol }, 'Signal failed validation schema');
+            }
           } else {
             countScore++;
             console.log(`[DEBUG-SERVER] REJECT ${symbol}: Score ${finalScore} kurang daripada minScore (${settings.minScore})`);
@@ -1235,7 +1364,7 @@ async function runMarketScan(): Promise<Signal[]> {
             console.warn(`[Market Scan] Simbol ${symbol} tidak wujud di Binance (HTTP 400). Ditambah ke senarai langkau.`);
             nonExistentSymbols.add(symbol);
           } else {
-            console.error(`[Market Scan] Gagal memproses ${symbol}:`, err.message || err);
+            logger.error({ error: err.message || err, symbol }, 'Failed to process symbol');
           }
         }
       })
@@ -1291,6 +1420,8 @@ async function runMarketScan(): Promise<Signal[]> {
 
   await db.collection('market_snapshot').doc('latest').set(marketStatusDoc);
 
+  clearCaches();
+
   console.log(`[Funnel Summary] Total: ${universe.length} | Regime NEUTRAL/RANGE/Unstable: ${countNeutral} | Reject VolumeSpike: ${countVol} | Reject Spread: ${countSpread} | Reject FundingRate: ${countFunding} | Reject RR: ${countRR} | Reject Score<min: ${countScore} | LULUS SEMUA (Tradeable): ${tradeableSignals.length}`);
   console.log(`[Market Scan] Finished scanning. Found ${tradeableSignals.length} qualified trade signals, and ${validSignals.filter(s => s.noTrade).length} NO TRADE regimes.`);
   return validSignals;
@@ -1337,6 +1468,10 @@ async function getBtcTrend(): Promise<'BULLISH' | 'BEARISH' | 'NEUTRAL'> {
 
 // GET Performance & Cumulative R-Multiple Backtest stats
 app.get('/api/performance', async (req, res) => {
+  const cached = appCache.get('performance');
+  if (cached) {
+    return res.json(cached);
+  }
   try {
     const settings = await getSettings();
     const minRR = settings.minRR || 1.5;
@@ -1390,7 +1525,7 @@ app.get('/api/performance', async (req, res) => {
 
     const avgRRRealized = winCount > 0 ? parseFloat((totalWinRR / winCount).toFixed(1)) : parseFloat(minRR.toFixed(1));
 
-    res.json({
+    const result = {
       totalSignals,
       winRateOverall: parseFloat(winRateOverall.toFixed(1)),
       winRateAPlus: parseFloat(winRateAPlus.toFixed(1)),
@@ -1398,7 +1533,10 @@ app.get('/api/performance', async (req, res) => {
       winRateB: parseFloat(winRateB.toFixed(1)),
       avgRRRealized,
       equityCurve,
-    });
+    };
+
+    appCache.set('performance', result);
+    res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1415,6 +1553,7 @@ app.post('/api/settings', async (req, res) => {
   try {
     const newSettings = req.body as AppSettings;
     await db.collection('settings').doc('global').set(newSettings);
+    clearCaches();
     res.json({ success: true, settings: newSettings });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -1423,6 +1562,10 @@ app.post('/api/settings', async (req, res) => {
 
 // GET Latest Signals
 app.get('/api/signals', async (req, res) => {
+  const cached = appCache.get('signals');
+  if (cached) {
+    return res.json(cached);
+  }
   try {
     // Return all signals generated in the last 24 hours
     const yesterday = Date.now() - 24 * 60 * 60 * 1000;
@@ -1487,6 +1630,7 @@ app.get('/api/signals', async (req, res) => {
       }
     }
 
+    appCache.set('signals', list);
     res.json(list);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -1559,11 +1703,16 @@ app.get('/api/live-prices/stream', (req, res) => {
 
 // GET Historical Signal Logs
 app.get('/api/historical-logs', async (req, res) => {
+  const cached = appCache.get('historical-logs');
+  if (cached) {
+    return res.json(cached);
+  }
   try {
     const snapshot = await db.collection('signals_history').orderBy('timestamp', 'desc').get();
     let list = snapshot.docs.map(doc => doc.data() as Signal);
     // Programmatically filter out any persistent noTrade records from historical logs
     list = list.filter(s => !s.noTrade);
+    appCache.set('historical-logs', list);
     res.json(list);
   } catch (err: any) {
     res.status(500).json({ error: err.message });

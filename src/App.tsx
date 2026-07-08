@@ -9,15 +9,79 @@ import SettingsPanel from './components/SettingsPanel';
 import MarketRegimeOverview from './components/MarketRegimeOverview';
 import { Signal, MarketStatus } from './types';
 import { ShieldAlert, BarChart3, TrendingUp, Settings as SettingsIcon, AlertCircle, RefreshCw, Layers } from 'lucide-react';
+import { useSignalStore } from './store/signalStore';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'terminal' | 'regimes' | 'performance' | 'settings'>('terminal');
-  const [signals, setSignals] = useState<Signal[]>([]);
-  const [marketStatus, setMarketStatus] = useState<MarketStatus | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [selectedSignal, setSelectedSignal] = useState<Signal | null>(null);
-  const [lastScanTime, setLastScanTime] = useState<number>(0);
-  const [livePrices, setLivePrices] = useState<Record<string, { bidPrice: number, askPrice: number, markPrice: number }>>({});
+  const queryClient = useQueryClient();
+
+  const {
+    signals,
+    marketStatus,
+    loading,
+    selectedSignal,
+    lastScanTime,
+    livePrices,
+    setLivePrices,
+    setSelectedSignal,
+    setSignals,
+    setMarketStatus,
+    setLastScanTime,
+    setLoading,
+  } = useSignalStore();
+
+  const fetchSignals = async () => {
+    const res = await fetch('/api/signals');
+    if (!res.ok) throw new Error('Gagal mengambil data isyarat');
+    return res.json();
+  };
+
+  const fetchMarketStatus = async () => {
+    const res = await fetch('/api/market-status');
+    if (!res.ok) throw new Error('Gagal mengambil status pasaran');
+    return res.json();
+  };
+
+  const { data: queriedSignals, isLoading: signalsLoading } = useQuery<Signal[]>({
+    queryKey: ['signals'],
+    queryFn: fetchSignals,
+    refetchInterval: 5000,
+  });
+
+  const { data: queriedMarketStatus, isLoading: marketLoading } = useQuery<MarketStatus>({
+    queryKey: ['market-status'],
+    queryFn: fetchMarketStatus,
+    refetchInterval: 5000,
+  });
+
+  useEffect(() => {
+    setLoading(signalsLoading || marketLoading);
+  }, [signalsLoading, marketLoading, setLoading]);
+
+  useEffect(() => {
+    if (queriedSignals) {
+      setSignals(queriedSignals);
+      // Auto-select first A+ or first signal if none selected
+      if (queriedSignals.length > 0 && !selectedSignal) {
+        const aPlus = queriedSignals.find((s: Signal) => s.score >= 90 && s.outcome === 'PENDING');
+        if (aPlus) {
+          setSelectedSignal(aPlus);
+        } else {
+          setSelectedSignal(queriedSignals[0]);
+        }
+      }
+    }
+  }, [queriedSignals, setSignals, selectedSignal, setSelectedSignal]);
+
+  useEffect(() => {
+    if (queriedMarketStatus) {
+      setMarketStatus(queriedMarketStatus);
+      if (queriedMarketStatus.lastScanTime) {
+        setLastScanTime(queriedMarketStatus.lastScanTime);
+      }
+    }
+  }, [queriedMarketStatus, setMarketStatus, setLastScanTime]);
 
   useEffect(() => {
     console.log('[SSE] Connecting to /api/live-prices/stream...');
@@ -50,76 +114,11 @@ export default function App() {
       console.log('[SSE] Disconnecting EventSource...');
       eventSource.close();
     };
-  }, []);
-
-  const fetchLatestData = async () => {
-    setLoading(true);
-    console.log('[DEBUG] Memulakan fetchLatestData(). Mengambil data isyarat dari /api/signals...');
-    try {
-      // Fetch latest signals
-      const signalsRes = await fetch('/api/signals');
-      console.log(`[DEBUG] Respon /api/signals diterima. Status: ${signalsRes.status} (${signalsRes.statusText})`);
-      
-      if (signalsRes.ok) {
-        const signalsData = await signalsRes.json();
-        console.log('[DEBUG] Isyarat JSON berjaya diparsing:', signalsData);
-        console.log(`[DEBUG] Jumlah keseluruhan isyarat diterima: ${signalsData.length}`);
-        
-        const tradeable = signalsData.filter((s: Signal) => !s.noTrade);
-        const placeholders = signalsData.filter((s: Signal) => s.noTrade);
-        console.log(`[DEBUG] -> Isyarat Boleh Didagang (Tradeable): ${tradeable.length}`);
-        console.log(`[DEBUG] -> Isyarat Tiada Dagangan (noTrade Placeholders): ${placeholders.length}`);
-        
-        if (signalsData.length === 0) {
-          console.warn('[DEBUG] AMARAN: /api/signals mengembalikan array kosong! Tiada isyarat dijumpai dalam tempoh 24 jam terakhir.');
-        } else {
-          console.log('[DEBUG] Sampel isyarat pertama:', signalsData[0]);
-        }
-
-        setSignals(signalsData);
-        
-        // Auto select the first A+ signal if none is selected
-        if (signalsData.length > 0 && !selectedSignal) {
-          const aPlus = signalsData.find((s: Signal) => s.score >= 90 && s.outcome === 'PENDING');
-          if (aPlus) {
-            console.log('[DEBUG] Memilih isyarat Grade A+ secara automatik:', aPlus.coin);
-            setSelectedSignal(aPlus);
-          } else {
-            console.log('[DEBUG] Tiada isyarat A+, memilih isyarat pertama secara automatik:', signalsData[0].coin);
-            setSelectedSignal(signalsData[0]);
-          }
-        }
-      } else {
-        console.error('[DEBUG] Ralat HTTP semasa mengambil isyarat:', signalsRes.status, signalsRes.statusText);
-      }
-
-      // Fetch market snapshot status
-      console.log('[DEBUG] Mengambil status pasaran semasa dari /api/market-status...');
-      const statusRes = await fetch('/api/market-status');
-      console.log(`[DEBUG] Respon /api/market-status diterima. Status: ${statusRes.status}`);
-      
-      if (statusRes.ok) {
-        const statusData = await statusRes.json();
-        console.log('[DEBUG] Status pasaran berjaya diparsing:', statusData);
-        setMarketStatus(statusData);
-        setLastScanTime(statusData.lastScanTime);
-      } else {
-        console.error('[DEBUG] Ralat HTTP semasa mengambil status pasaran:', statusRes.status);
-      }
-    } catch (err) {
-      console.error('[DEBUG] Ralat kritikal gagal memuatkan data aplikasi:', err);
-    } finally {
-      setLoading(false);
-      console.log('[DEBUG] Selesai fetchLatestData(). Loading set to false.');
-    }
-  };
-
-  useEffect(() => {
-    fetchLatestData();
-  }, []);
+  }, [setLivePrices]);
 
   const handleScanComplete = () => {
-    fetchLatestData();
+    queryClient.invalidateQueries({ queryKey: ['signals'] });
+    queryClient.invalidateQueries({ queryKey: ['market-status'] });
   };
 
   const handleSelectCoin = (coinSymbol: string) => {
@@ -235,7 +234,7 @@ export default function App() {
 
           {/* Hard Sync Button */}
           <button
-            onClick={fetchLatestData}
+            onClick={handleScanComplete}
             disabled={loading}
             className="ml-auto px-4 py-3 text-neutral-500 hover:text-neutral-300 flex items-center gap-1 bg-neutral-950/20"
           >
@@ -278,7 +277,7 @@ export default function App() {
             status={marketStatus} 
             signals={signals} 
             onSelectCoin={handleSelectCoin} 
-            onRefresh={fetchLatestData}
+            onRefresh={handleScanComplete}
             loading={loading}
           />
         )}
@@ -288,7 +287,7 @@ export default function App() {
         )}
 
         {activeTab === 'settings' && (
-          <SettingsPanel onSettingsSaved={fetchLatestData} />
+          <SettingsPanel onSettingsSaved={handleScanComplete} />
         )}
       </main>
 
