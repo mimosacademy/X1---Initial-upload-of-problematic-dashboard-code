@@ -7,33 +7,20 @@ import pino from 'pino';
 import { z } from 'zod';
 import rateLimit from 'express-rate-limit';
 import NodeCache from 'node-cache';
-import * as Sentry from '@sentry/node';
+
+// Hardcoded application defaults replacing all environment variable validation
+const config = {
+  logLevel: 'info',
+  sentryEnabled: false,
+  nodeEnv: process.env.NODE_ENV || 'development'
+};
 
 const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
+  level: config.logLevel,
   transport: {
     target: 'pino-pretty',
   },
 });
-
-// Environment variable validation using native Zod
-const envSchema = z.object({
-  GEMINI_API_KEY: z.string().default(''),
-  PORT: z.coerce.number().default(3000),
-  NODE_ENV: z.enum(['dev', 'prod', 'development', 'production']).default('dev'),
-  SENTRY_DSN: z.string().default(''),
-});
-
-const env = envSchema.parse(process.env);
-
-// Initialize Sentry for error tracking if SENTRY_DSN is provided
-if (env.SENTRY_DSN) {
-  Sentry.init({
-    dsn: env.SENTRY_DSN as string,
-    environment: env.NODE_ENV as string,
-  });
-  logger.info('Sentry error tracking initialized.');
-}
 
 const SignalSchema = z.object({
   coin: z.string().min(1),
@@ -501,6 +488,7 @@ async function getCachedKlines4H(symbol: string): Promise<any> {
 }
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json());
 
 const limiter = rateLimit({
@@ -557,7 +545,7 @@ async function generateNarrative(coin: string, direction: string, metrics: any):
     return `Aliran ${direction === 'LONG' ? 'Bullish' : 'Bearish'} yang kuat dikesan pada ${coin}. EMA50 berada di atas EMA200 dengan lonjakan volume ${metrics.volumeSpike.toFixed(0)}% di pasaran futures.`;
   }
 
-  const runWithRetry = async (retries = 1, delayMs = 1500): Promise<string> => {
+  const runWithRetry = async (retries = 2, delayMs = 1500): Promise<string> => {
     try {
       const ai = new GoogleGenAI({ apiKey, httpOptions: { headers: { 'User-Agent': 'aistudio-build' } } });
       const prompt = `Anda adalah seorang pakar penganalisis pasaran crypto futures perpetual. Guna data numerik berikut untuk menjana penjelasan teknikal ringkas (maksimum 2 ayat sahaja) dalam Bahasa Melayu yang menerangkan mengapa signal ini dipilih. JANGAN sesekali mereka atau mengira semula nombor baru. Bahasa Melayu mestilah profesional, kemas dan padat.
@@ -580,9 +568,17 @@ async function generateNarrative(coin: string, direction: string, metrics: any):
 
       return response.text?.trim() || `Aliran ${direction} disokong oleh momentum RSI dan lonjakan volume yang signifikan.`;
     } catch (err: any) {
-      const isRateLimit = err?.message?.includes("429") || err?.message?.includes("RESOURCE_EXHAUSTED");
-      if (retries > 0 && isRateLimit) {
-        console.warn(`[Gemini Narrative Retry] Rate limited. Retrying in ${delayMs}ms...`);
+      const errMsg = (err?.message || "").toUpperCase();
+      const isRateLimitOrUnavailable = 
+        errMsg.includes("429") || 
+        errMsg.includes("RESOURCE_EXHAUSTED") || 
+        errMsg.includes("503") || 
+        errMsg.includes("UNAVAILABLE") || 
+        errMsg.includes("HIGH DEMAND") ||
+        errMsg.includes("OVERLOADED");
+
+      if (retries > 0 && isRateLimitOrUnavailable) {
+        console.warn(`[Gemini Narrative Retry] Rate limit or high demand (${err?.message}) detected. Retrying in ${delayMs}ms...`);
         await sleep(delayMs);
         return runWithRetry(retries - 1, delayMs * 2);
       }
@@ -592,8 +588,8 @@ async function generateNarrative(coin: string, direction: string, metrics: any):
 
   try {
     return await runWithRetry();
-  } catch (error) {
-    console.error('Gemini API error generating narrative:', error);
+  } catch (error: any) {
+    console.warn('[Gemini Narrative Warning] Gemini API is currently experiencing high demand or unavailable. Using fallback narrative. Error:', error?.message);
     return `Isyarat ${direction} dikesan di mana kline berada dalam zon momentum sihat dengan pengesahan volume spike sebanyak ${metrics.volumeSpike.toFixed(0)}%.`;
   }
 }
@@ -890,6 +886,7 @@ async function runMarketScan(): Promise<Signal[]> {
   });
 
   const validSignals: Signal[] = [];
+  const simulationRecords: any[] = [];
   const coinRegimes: Array<{ coin: string; regimeId: number; label: string; stable: boolean }> = [];
   const regimeCounts: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0 };
 
@@ -1057,6 +1054,26 @@ async function runMarketScan(): Promise<Signal[]> {
               noTradeReason,
             };
             validSignals.push(noTradeSignal);
+            simulationRecords.push({
+              coin: symbol,
+              regimeId: regimeEval.id,
+              regimeLabel: regimeEval.label,
+              stable: regimeEval.stable,
+              trend1D: regimeEval.trend1D,
+              trend4H: regimeEval.trend4H,
+              rsi15M: m15RsiLast,
+              rsi4H: 0,
+              volumeSpike,
+              spread,
+              bidAskRatio,
+              cvdDelta10: 0,
+              cvdAlign: false,
+              fundingRate: 0,
+              score: 0,
+              rr: 0,
+              status: 'REJECTED',
+              rejectReason: noTradeReason
+            });
             return; // EXIT Pipeline
           }
 
@@ -1107,6 +1124,26 @@ async function runMarketScan(): Promise<Signal[]> {
             if (volumeSpike < settings.minVolumeSpike) {
               countVol++;
               console.log(`[DEBUG-SERVER] REJECT ${symbol} (Expansion): volumeSpike (${volumeSpike.toFixed(1)}%) kurang daripada minVolumeSpike (${settings.minVolumeSpike}%)`);
+              simulationRecords.push({
+                coin: symbol,
+                regimeId: regimeEval.id,
+                regimeLabel: regimeEval.label,
+                stable: regimeEval.stable,
+                trend1D: regimeEval.trend1D,
+                trend4H: regimeEval.trend4H,
+                rsi15M: m15RsiLast,
+                rsi4H: h4RsiLast,
+                volumeSpike,
+                spread,
+                bidAskRatio,
+                cvdDelta10: 0,
+                cvdAlign: false,
+                fundingRate: 0,
+                score: 0,
+                rr: 0,
+                status: 'REJECTED',
+                rejectReason: `Lonjakan Volume (${volumeSpike.toFixed(0)}%) kurang daripada syarat minimum (${settings.minVolumeSpike}%)`
+              });
               return;
             }
           } else if (regimeEval.id === 3 || regimeEval.id === 7) {
@@ -1114,6 +1151,26 @@ async function runMarketScan(): Promise<Signal[]> {
             if (volumeSpike < 40 || volumeSpike > 350) {
               countVol++;
               console.log(`[DEBUG-SERVER] REJECT ${symbol} (Pullback): volumeSpike (${volumeSpike.toFixed(1)}%) di luar julat tenang/pullback (40%-350%)`);
+              simulationRecords.push({
+                coin: symbol,
+                regimeId: regimeEval.id,
+                regimeLabel: regimeEval.label,
+                stable: regimeEval.stable,
+                trend1D: regimeEval.trend1D,
+                trend4H: regimeEval.trend4H,
+                rsi15M: m15RsiLast,
+                rsi4H: h4RsiLast,
+                volumeSpike,
+                spread,
+                bidAskRatio,
+                cvdDelta10: 0,
+                cvdAlign: false,
+                fundingRate: 0,
+                score: 0,
+                rr: 0,
+                status: 'REJECTED',
+                rejectReason: `Volume (${volumeSpike.toFixed(0)}%) di luar julat pullback tenang (40% - 350%)`
+              });
               return;
             }
           }
@@ -1131,6 +1188,26 @@ async function runMarketScan(): Promise<Signal[]> {
           if (spread > 0.15) {
             countSpread++;
             console.log(`[DEBUG-SERVER] REJECT ${symbol}: spread (${spread.toFixed(3)}%) melebihi had 0.15%`);
+            simulationRecords.push({
+              coin: symbol,
+              regimeId: regimeEval.id,
+              regimeLabel: regimeEval.label,
+              stable: regimeEval.stable,
+              trend1D: regimeEval.trend1D,
+              trend4H: regimeEval.trend4H,
+              rsi15M: m15RsiLast,
+              rsi4H: h4RsiLast,
+              volumeSpike,
+              spread,
+              bidAskRatio,
+              cvdDelta10,
+              cvdAlign,
+              fundingRate: 0,
+              score: 0,
+              rr: 0,
+              status: 'REJECTED',
+              rejectReason: `Sela spread bid-ask terlalu lebar (${spread.toFixed(3)}% > 0.15%)`
+            });
             return;
           }
 
@@ -1139,11 +1216,51 @@ async function runMarketScan(): Promise<Signal[]> {
           if (direction === 'LONG' && fundingRate > 0.05) {
             countFunding++;
             console.log(`[DEBUG-SERVER] REJECT ${symbol}: fundingRate LONG (${fundingRate.toFixed(3)}) melebihi had 0.05`);
+            simulationRecords.push({
+              coin: symbol,
+              regimeId: regimeEval.id,
+              regimeLabel: regimeEval.label,
+              stable: regimeEval.stable,
+              trend1D: regimeEval.trend1D,
+              trend4H: regimeEval.trend4H,
+              rsi15M: m15RsiLast,
+              rsi4H: h4RsiLast,
+              volumeSpike,
+              spread,
+              bidAskRatio,
+              cvdDelta10,
+              cvdAlign,
+              fundingRate,
+              score: 0,
+              rr: 0,
+              status: 'REJECTED',
+              rejectReason: `Kadar pendanaan LONG terlalu tinggi (${fundingRate.toFixed(3)} > 0.05)`
+            });
             return;
           }
           if (direction === 'SHORT' && fundingRate < -0.05) {
             countFunding++;
             console.log(`[DEBUG-SERVER] REJECT ${symbol}: fundingRate SHORT (${fundingRate.toFixed(3)}) kurang daripada had -0.05`);
+            simulationRecords.push({
+              coin: symbol,
+              regimeId: regimeEval.id,
+              regimeLabel: regimeEval.label,
+              stable: regimeEval.stable,
+              trend1D: regimeEval.trend1D,
+              trend4H: regimeEval.trend4H,
+              rsi15M: m15RsiLast,
+              rsi4H: h4RsiLast,
+              volumeSpike,
+              spread,
+              bidAskRatio,
+              cvdDelta10,
+              cvdAlign,
+              fundingRate,
+              score: 0,
+              rr: 0,
+              status: 'REJECTED',
+              rejectReason: `Kadar pendanaan SHORT terlalu negatif (${fundingRate.toFixed(3)} < -0.05)`
+            });
             return;
           }
 
@@ -1300,6 +1417,26 @@ async function runMarketScan(): Promise<Signal[]> {
           if (computedRR < minRequiredRR) {
             countRR++;
             console.log(`[DEBUG-SERVER] REJECT ${symbol}: Nisbah Risk/Reward (${computedRR.toFixed(2)}) kurang daripada had minimum ${minRequiredRR} (SL: ${stopLoss}, TP1: ${takeProfit1}, Entry: ${currentPrice})`);
+            simulationRecords.push({
+              coin: symbol,
+              regimeId: regimeEval.id,
+              regimeLabel: regimeEval.label,
+              stable: regimeEval.stable,
+              trend1D: regimeEval.trend1D,
+              trend4H: regimeEval.trend4H,
+              rsi15M: m15RsiLast,
+              rsi4H: h4RsiLast,
+              volumeSpike,
+              spread,
+              bidAskRatio,
+              cvdDelta10,
+              cvdAlign,
+              fundingRate,
+              score: 0,
+              rr: computedRR,
+              status: 'REJECTED',
+              rejectReason: `Nisbah R:R (${computedRR.toFixed(2)}) kurang daripada had minimum (${minRequiredRR})`
+            });
             return; // REJECT instantly if RR is not satisfied
           }
 
@@ -1451,12 +1588,72 @@ async function runMarketScan(): Promise<Signal[]> {
             if (validation.success) {
               logger.info({ symbol, score: finalScore }, 'Signal qualified');
               validSignals.push(signalData);
+              simulationRecords.push({
+                coin: symbol,
+                regimeId: regimeEval.id,
+                regimeLabel: regimeEval.label,
+                stable: regimeEval.stable,
+                trend1D: regimeEval.trend1D,
+                trend4H: regimeEval.trend4H,
+                rsi15M: m15RsiLast,
+                rsi4H: h4RsiLast,
+                volumeSpike,
+                spread,
+                bidAskRatio,
+                cvdDelta10,
+                cvdAlign,
+                fundingRate,
+                score: finalScore,
+                rr: computedRR,
+                status: 'PASSED',
+                rejectReason: ''
+              });
             } else {
               logger.error({ error: validation.error, symbol }, 'Signal failed validation schema');
+              simulationRecords.push({
+                coin: symbol,
+                regimeId: regimeEval.id,
+                regimeLabel: regimeEval.label,
+                stable: regimeEval.stable,
+                trend1D: regimeEval.trend1D,
+                trend4H: regimeEval.trend4H,
+                rsi15M: m15RsiLast,
+                rsi4H: h4RsiLast,
+                volumeSpike,
+                spread,
+                bidAskRatio,
+                cvdDelta10,
+                cvdAlign,
+                fundingRate,
+                score: finalScore,
+                rr: computedRR,
+                status: 'REJECTED',
+                rejectReason: 'Gagal pengesahan skema pengesah (Zod schema fail)'
+              });
             }
           } else {
             countScore++;
             console.log(`[DEBUG-SERVER] REJECT ${symbol}: Score ${finalScore} kurang daripada minScore (${settings.minScore})`);
+            simulationRecords.push({
+              coin: symbol,
+              regimeId: regimeEval.id,
+              regimeLabel: regimeEval.label,
+              stable: regimeEval.stable,
+              trend1D: regimeEval.trend1D,
+              trend4H: regimeEval.trend4H,
+              rsi15M: m15RsiLast,
+              rsi4H: h4RsiLast,
+              volumeSpike,
+              spread,
+              bidAskRatio,
+              cvdDelta10,
+              cvdAlign,
+              fundingRate,
+              score: finalScore,
+              rr: computedRR,
+              status: 'REJECTED',
+              rejectReason: `Skor kekuatan (${finalScore}/100) kurang daripada skor minimum (${settings.minScore}/100)`
+            });
           }
         } catch (err: any) {
           if (err.message && err.message.includes('SYMBOL_NOT_EXIST')) {
@@ -1515,6 +1712,7 @@ async function runMarketScan(): Promise<Signal[]> {
     lastScanTime: Date.now(),
     regimeCounts,
     coinRegimes,
+    simulations: simulationRecords,
   };
 
   await db.collection('market_snapshot').doc('latest').set(marketStatusDoc);
@@ -1823,7 +2021,7 @@ app.get('/api/historical-logs', async (req, res) => {
 // ==========================================
 async function startServer() {
   // 1. Mount Vite middleware in development or static folder in production
-  if (process.env.NODE_ENV !== 'production') {
+  if (config.nodeEnv !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',

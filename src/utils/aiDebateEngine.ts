@@ -90,15 +90,23 @@ export async function findCachedDebate(
 }
 
 /**
- * Executes a Gemini function with protective backoff for 429/Resource Exhausted rate limits.
+ * Executes a Gemini function with protective backoff for 429/Resource Exhausted rate limits and 503/Unavailable server states.
  */
-async function callGeminiWithRetry<T>(fn: () => Promise<T>, retries = 1, delayMs = 1500): Promise<T> {
+async function callGeminiWithRetry<T>(fn: () => Promise<T>, retries = 2, delayMs = 1500): Promise<T> {
   try {
     return await fn();
   } catch (err: any) {
-    const isRateLimit = err?.message?.includes("429") || err?.message?.includes("RESOURCE_EXHAUSTED");
-    if (retries > 0 && isRateLimit) {
-      console.warn(`[Gemini Rate Limit] 429/RESOURCE_EXHAUSTED detected. Retrying in ${delayMs}ms...`);
+    const errMsg = (err?.message || "").toUpperCase();
+    const isRateLimitOrUnavailable = 
+      errMsg.includes("429") || 
+      errMsg.includes("RESOURCE_EXHAUSTED") || 
+      errMsg.includes("503") || 
+      errMsg.includes("UNAVAILABLE") || 
+      errMsg.includes("HIGH DEMAND") ||
+      errMsg.includes("OVERLOADED");
+
+    if (retries > 0 && isRateLimitOrUnavailable) {
+      console.warn(`[Gemini API Retry] Rate limit or high demand detected (${err?.message}). Retrying in ${delayMs}ms...`);
       await sleep(delayMs);
       return callGeminiWithRetry(fn, retries - 1, delayMs * 2);
     }
@@ -280,7 +288,7 @@ ${dataPayload}`;
       };
 
       const analystsRes = await withTimeout(
-        callGeminiWithRetry(runCombinedCall, 1, 1500),
+        callGeminiWithRetry(runCombinedCall, 2, 1500),
         25000,
         "AI Debate Phase 1 timed out (> 25s)"
       );
@@ -321,7 +329,7 @@ ${JSON.stringify(riskRes, null, 2)}`;
       };
 
       const judgeRes = await withTimeout(
-        callGeminiWithRetry(runJudgeCall, 1, 1500),
+        callGeminiWithRetry(runJudgeCall, 2, 1500),
         25000,
         "AI Debate Judge Phase timed out (> 25s)"
       );
@@ -342,7 +350,7 @@ ${JSON.stringify(riskRes, null, 2)}`;
       console.log(`[AI Debate] Finished debate for ${sig.coin} successfully. Verdict: ${judgeRes.final_verdict}, Adjusted Score: ${judgeRes.adjusted_confidence_score}`);
 
     } catch (err: any) {
-      console.error(`[AI Debate] Failed running debate for ${sig.coin}:`, err.message);
+      console.warn(`[AI Debate Warning] Gemini API is currently experiencing high demand or timed out. Failed running live debate for ${sig.coin}:`, err.message);
       
       // Fallback: static template debate transcript so application behaves beautifully
       const fallbackTranscript: DebateTranscript = {

@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { AppSettings } from '../types';
-import { Settings, Save, AlertCircle, HelpCircle, CheckCircle2 } from 'lucide-react';
+import { Settings, Save, AlertCircle, HelpCircle, CheckCircle2, Search, ChevronDown, ChevronUp } from 'lucide-react';
 import { FIXED_TRADE_PAIRS } from '../config/pairs';
+import { useSignalStore } from '../store/signalStore';
 
 interface SettingsPanelProps {
   onSettingsSaved: () => void;
@@ -12,6 +13,12 @@ export default function SettingsPanel({ onSettingsSaved }: SettingsPanelProps) {
   const [saving, setSaving] = useState(false);
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Simulation state hooks
+  const [showSimulation, setShowSimulation] = useState(true);
+  const [search, setSearch] = useState('');
+  const [filterStatus, setFilterStatus] = useState<'ALL' | 'PASSED' | 'REJECTED'>('ALL');
+  const marketStatus = useSignalStore((state) => state.marketStatus);
 
   useEffect(() => {
     // Fetch current settings
@@ -239,6 +246,152 @@ export default function SettingsPanel({ onSettingsSaved }: SettingsPanelProps) {
           </button>
         </div>
       </form>
+
+      {/* Collapsible Simulation Block */}
+      <div className="border-t border-neutral-800/80 pt-5 mt-4 space-y-4">
+        <button
+          type="button"
+          onClick={() => setShowSimulation(!showSimulation)}
+          className="w-full flex items-center justify-between bg-neutral-900/40 hover:bg-neutral-900 border border-neutral-800/60 rounded px-4 py-3 text-neutral-300 font-sans font-bold transition-all"
+        >
+          <div className="flex items-center gap-2">
+            <span className="text-emerald-400">🔬</span>
+            <span className="uppercase tracking-wider text-xs">Simulasi & Diagnostik Isyarat ({(marketStatus?.simulations || []).length} Koin)</span>
+          </div>
+          {showSimulation ? <ChevronUp className="h-4 w-4 text-emerald-400" /> : <ChevronDown className="h-4 w-4 text-emerald-400" />}
+        </button>
+
+        {showSimulation && (
+          <div className="space-y-4 animate-fade-in">
+            <p className="text-[10px] text-neutral-500 leading-normal font-sans">
+              Uji syarat teknikal secara real-time untuk setiap pasangan crypto di bawah. Di sini anda boleh mengenal pasti kenapa syarat ketat (seperti sela spread, lonjakan volume, atau trend alignment) menolak mana-mana isyarat daripada dijana.
+            </p>
+
+            {/* Filters */}
+            <div className="flex flex-col sm:flex-row gap-2.5 items-center justify-between font-mono">
+              {/* Search bar */}
+              <div className="relative w-full sm:max-w-[200px]">
+                <span className="absolute inset-y-0 left-0 flex items-center pl-2.5 pointer-events-none text-neutral-600">
+                  <Search className="h-3 w-3" />
+                </span>
+                <input
+                  type="text"
+                  placeholder="Cari pasangan..."
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  className="w-full bg-neutral-950 border border-neutral-800 rounded pl-7 pr-2 py-1 text-[10px] text-zinc-300 placeholder-neutral-600 focus:outline-none focus:border-emerald-500 transition-all"
+                />
+              </div>
+
+              {/* Tab Filter Status */}
+              <div className="flex items-center gap-1 bg-neutral-950 border border-neutral-800 p-0.5 rounded text-[9px] w-full sm:w-auto">
+                <button
+                  type="button"
+                  onClick={() => setFilterStatus('ALL')}
+                  className={`px-2 py-0.5 rounded transition-all font-bold ${filterStatus === 'ALL' ? 'bg-neutral-900 text-emerald-400' : 'text-neutral-500 hover:text-neutral-300'}`}
+                >
+                  Semua ({(marketStatus?.simulations || []).length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFilterStatus('PASSED')}
+                  className={`px-2 py-0.5 rounded transition-all font-bold ${filterStatus === 'PASSED' ? 'bg-emerald-950/40 text-emerald-400' : 'text-neutral-500 hover:text-neutral-300'}`}
+                >
+                  Lulus ({(marketStatus?.simulations || []).filter(s => s.status === 'PASSED').length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFilterStatus('REJECTED')}
+                  className={`px-2 py-0.5 rounded transition-all font-bold ${filterStatus === 'REJECTED' ? 'bg-red-950/40 text-red-400' : 'text-neutral-500 hover:text-neutral-300'}`}
+                >
+                  Ditolak ({(marketStatus?.simulations || []).filter(s => s.status === 'REJECTED').length})
+                </button>
+              </div>
+            </div>
+
+            {/* Main Simulations Table/Cards list */}
+            {((marketStatus?.simulations || []).filter(sim => {
+              const matchesSearch = sim.coin.toLowerCase().includes(search.toLowerCase());
+              const matchesStatus = filterStatus === 'ALL' || sim.status === filterStatus;
+              return matchesSearch && matchesStatus;
+            })).length === 0 ? (
+              <div className="border border-neutral-900 bg-neutral-950/40 rounded p-6 text-center text-neutral-600 font-sans text-[11px]">
+                {(marketStatus?.simulations || []).length === 0 
+                  ? "Tiada data simulasi semasa. Sila lancarkan imbasan pasaran (Manual Scan) terlebih dahulu untuk memaparkan status kriteria bagi semua pasangan crypto."
+                  : "Tiada pasangan crypto yang sepadan dengan carian anda."}
+              </div>
+            ) : (
+              <div className="border border-neutral-900 bg-neutral-950/20 rounded overflow-hidden max-h-80 overflow-y-auto scrollbar-thin scrollbar-thumb-neutral-800">
+                <div className="divide-y divide-neutral-900">
+                  {((marketStatus?.simulations || []).filter(sim => {
+                    const matchesSearch = sim.coin.toLowerCase().includes(search.toLowerCase());
+                    const matchesStatus = filterStatus === 'ALL' || sim.status === filterStatus;
+                    return matchesSearch && matchesStatus;
+                  })).map((sim) => {
+                    const isPassed = sim.status === 'PASSED';
+                    return (
+                      <div key={sim.coin} className="p-2.5 hover:bg-neutral-900/20 transition-all space-y-1.5">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-mono font-bold text-zinc-200 text-[11px]">{sim.coin}</span>
+                            <span className="text-[9px] text-neutral-500 bg-neutral-900 px-1 py-0.5 rounded font-mono">
+                              {sim.regimeLabel}
+                            </span>
+                          </div>
+                          <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded uppercase border font-mono ${
+                            isPassed 
+                              ? 'bg-emerald-950/30 border-emerald-900/60 text-emerald-400' 
+                              : 'bg-red-950/20 border-red-900/50 text-red-400'
+                          }`}>
+                            {isPassed ? 'Lulus' : 'Ditolak'}
+                          </span>
+                        </div>
+
+                        {/* Detailed Indicators Tested */}
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 font-mono text-[9px] text-neutral-400 bg-neutral-950 p-1.5 rounded border border-neutral-900/30">
+                          <div>
+                            <span className="text-neutral-600 block text-[8px] uppercase">RSI 15M/4H</span>
+                            <span className="font-bold text-zinc-300">
+                              {(sim.rsi15M || 0).toFixed(1)} <span className="text-neutral-600">/</span> {(sim.rsi4H || 0).toFixed(1)}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-neutral-600 block text-[8px] uppercase">Trend 1D/4H</span>
+                            <span className={`font-bold ${sim.trend1D === 'BULLISH' ? 'text-emerald-500' : sim.trend1D === 'BEARISH' ? 'text-red-500' : 'text-neutral-500'}`}>
+                              {sim.trend1D || 'NEUTRAL'}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-neutral-600 block text-[8px] uppercase">Vol Spike</span>
+                            <span className={`font-bold ${sim.volumeSpike >= 120 ? 'text-emerald-400' : 'text-zinc-400'}`}>
+                              {(sim.volumeSpike || 0).toFixed(0)}%
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-neutral-600 block text-[8px] uppercase">Sela Spread</span>
+                            <span className={`font-bold ${sim.spread > 0.15 ? 'text-red-400' : 'text-emerald-400'}`}>
+                              {(sim.spread || 0).toFixed(3)}%
+                            </span>
+                          </div>
+                        </div>
+
+                        {!isPassed && sim.rejectReason && (
+                          <div className="text-[9px] font-sans flex items-start gap-1 text-neutral-500 bg-red-950/5 border border-red-950/10 rounded p-1 leading-normal">
+                            <span className="text-red-500 mt-0.5">⚠️</span>
+                            <span>
+                              <strong className="text-neutral-400">Gagal:</strong> {sim.rejectReason}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

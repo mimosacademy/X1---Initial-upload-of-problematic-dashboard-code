@@ -60,6 +60,26 @@ export interface MarketStatus {
   lastScanTime: number;
   regimeCounts?: Record<number, number>;
   coinRegimes?: Array<{ coin: string; regimeId: number; label: string; stable: boolean }>;
+  simulations?: Array<{
+    coin: string;
+    regimeId: number;
+    regimeLabel: string;
+    stable: boolean;
+    trend1D: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+    trend4H: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+    rsi15M: number;
+    rsi4H: number;
+    volumeSpike: number;
+    spread: number;
+    bidAskRatio: number;
+    cvdDelta10: number;
+    cvdAlign: boolean;
+    fundingRate: number;
+    score: number;
+    rr: number;
+    status: 'PASSED' | 'REJECTED';
+    rejectReason: string;
+  }>;
 }
 
 export interface AppSettings {
