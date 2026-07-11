@@ -13,6 +13,9 @@ export default function SettingsPanel({ onSettingsSaved }: SettingsPanelProps) {
   const [saving, setSaving] = useState(false);
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [authToken, setAuthToken] = useState(() => {
+    return localStorage.getItem('admin_auth_token') || 'scalper_secret_token_2026';
+  });
 
   // Simulation state hooks
   const [showSimulation, setShowSimulation] = useState(true);
@@ -47,11 +50,17 @@ export default function SettingsPanel({ onSettingsSaved }: SettingsPanelProps) {
     try {
       const res = await fetch('/api/settings', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-Auth-Token': authToken
+        },
         body: JSON.stringify(settings),
       });
 
-      if (!res.ok) throw new Error('Gagal menyimpan tetapan.');
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || 'Gagal menyimpan tetapan.');
+      }
       
       setSavedSuccess(true);
       onSettingsSaved();
@@ -217,6 +226,26 @@ export default function SettingsPanel({ onSettingsSaved }: SettingsPanelProps) {
           </div>
           <p className="text-[10px] text-neutral-500 mt-2 leading-normal">
             Sila ambil perhatian: mengaktifkan range trading membenarkan isyarat di sempadan support dan resistance semasa regime pasaran "Range". Apabila dimatikan (default), isyarat Range akan ditolak untuk mengelakkan risiko whipsaw dan mengekalkan RR yang tinggi.
+          </p>
+        </div>
+
+        {/* 7. Admin Authentication Token Field */}
+        <div className="space-y-2 pt-2 border-t border-neutral-900 pt-3">
+          <label className="text-neutral-400 font-bold uppercase tracking-wider text-[10px] block">
+            Admin Authentication Token
+          </label>
+          <input 
+            type="password"
+            value={authToken}
+            onChange={(e) => {
+              setAuthToken(e.target.value);
+              localStorage.setItem('admin_auth_token', e.target.value);
+            }}
+            placeholder="Sila masukkan token pentadbir"
+            className="w-full bg-neutral-900 border border-neutral-800 rounded px-2.5 py-1.5 font-mono text-xs text-white focus:outline-none focus:border-emerald-500"
+          />
+          <p className="text-[10px] text-neutral-500 leading-normal">
+            Sistem memerlukan token pengesahan yang sah untuk menyimpan sebarang perubahan tetapan.
           </p>
         </div>
 

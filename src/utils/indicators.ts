@@ -1,6 +1,6 @@
 export function calculateEMA(prices: number[], period: number): number[] {
   const k = 2 / (period + 1);
-  const ema: number[] = new Array(prices.length).fill(0);
+  const ema: number[] = new Array(prices.length).fill(NaN);
   if (prices.length === 0) return [];
 
   let sum = 0;
@@ -8,9 +8,10 @@ export function calculateEMA(prices: number[], period: number): number[] {
     sum += prices[i];
   }
   let prevEma = sum / Math.min(period, prices.length);
-  ema[Math.min(period, prices.length) - 1] = prevEma;
+  const seedIndex = Math.min(period, prices.length) - 1;
+  ema[seedIndex] = prevEma;
 
-  for (let i = Math.min(period, prices.length); i < prices.length; i++) {
+  for (let i = seedIndex + 1; i < prices.length; i++) {
     const currentEma = prices[i] * k + prevEma * (1 - k);
     ema[i] = currentEma;
     prevEma = currentEma;

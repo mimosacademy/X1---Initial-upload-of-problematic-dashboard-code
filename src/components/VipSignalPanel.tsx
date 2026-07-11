@@ -13,7 +13,7 @@ export default function VipSignalPanel({ signals, onSelectSignal, livePrices = {
 
   // Get only top A+ signals (score >= 90), limit to 3, sorted by score descending
   const aPlusSignals = signals
-    .filter(s => s.score >= 90 && s.outcome === 'PENDING' && !s.noTrade && !(s as any).disputedByDebate)
+    .filter(s => s.score >= 90 && s.outcome === 'PENDING' && !s.noTrade)
     .slice(0, 3);
 
   useEffect(() => {
@@ -82,16 +82,6 @@ export default function VipSignalPanel({ signals, onSelectSignal, livePrices = {
                 }`}>
                   {isLong ? 'MUST FOLLOW' : 'A+ ENTRY'}
                 </div>
-                {(signal as any).debateVerdict === 'CONFIRMED_MUST_FOLLOW' && (
-                  <span className="text-[9px] bg-emerald-950/80 border border-emerald-500/30 text-emerald-400 font-bold px-1.5 py-0.5 rounded uppercase font-mono tracking-wider animate-pulse">
-                    ✅ Disahkan AI Debate
-                  </span>
-                )}
-                {(signal as any).debateFailed && (
-                  <span className="text-[8px] bg-neutral-950/80 border border-neutral-800 text-neutral-400 font-bold px-1 py-0.5 rounded font-mono uppercase">
-                    ⚠️ Debate Manual
-                  </span>
-                )}
               </div>
 
               <div>

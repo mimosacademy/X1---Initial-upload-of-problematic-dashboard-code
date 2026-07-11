@@ -29,6 +29,15 @@ const SignalSchema = z.object({
   entryPrice: z.number().positive(),
 });
 
+const AppSettingsSchema = z.object({
+  minRR: z.number().min(1.0).max(10.0),
+  minScore: z.number().min(0).max(100),
+  minVolumeSpike: z.number().min(0).max(2000),
+  minSampleSize: z.number().min(1).max(500),
+  universeSize: z.union([z.literal(50), z.literal(100), z.literal(150)]),
+  allowRangeTrading: z.boolean(),
+});
+
 // Cache engine with standard TTL (600 seconds)
 const appCache = new NodeCache({ stdTTL: 600 });
 
@@ -175,7 +184,9 @@ class LocalDb {
 
   private save() {
     try {
-      fs.writeFileSync(this.filePath, JSON.stringify(this.memoryData, null, 2), 'utf-8');
+      const tempPath = this.filePath + '.tmp';
+      fs.writeFileSync(tempPath, JSON.stringify(this.memoryData, null, 2), 'utf-8');
+      fs.renameSync(tempPath, this.filePath);
     } catch (err) {
       console.error('[LocalDb] Error writing file:', err);
     }
@@ -238,7 +249,7 @@ class LocalDb {
 }
 
 const db = new LocalDb();
-import { FIXED_TRADE_PAIRS } from './src/config/pairs.js';
+import { FIXED_TRADE_PAIRS, MEME_COINS_WITH_1000_PREFIX } from './src/config/pairs.js';
 import {
   calculateEMA,
   calculateRSI,
@@ -246,7 +257,6 @@ import {
   calculateATR,
 } from './src/utils/indicators.js';
 import { evaluateMarketRegime, REGIMES, getSwingStructure } from './src/utils/regimeEngine.js';
-import { runAIDebateLayer } from './src/utils/aiDebateEngine.js';
 import { Signal, SignalMetrics, SignalOutcome, AppSettings, MarketStatus } from './src/types.js';
 import { startLiveFeed, getLivePrice, getAllLivePrices } from './src/services/liveFeed.js';
 
@@ -363,41 +373,23 @@ async function fetchBinanceWithRetry(url: string, retries = 3, delayMs = 2000): 
   return binanceQueue.enqueue(url, retries, delayMs);
 }
 
+const BINANCE_MEME_COINS_WITH_1000_PREFIX = [
+  'PEPEUSDT',
+  'BONKUSDT',
+  'FLOKIUSDT',
+];
+
 function getBybitSymbol(symbol: string): string {
-  const memeCoinsWith1000Bybit = [
-    'PEPEUSDT',
-    'BONKUSDT',
-    'FLOKIUSDT',
-    'BRETTUSDT',
-    'TURBOUSDT',
-    'MEMEUSDT',
-    'POPCATUSDT',
-    'HMSTRUSDT',
-    'CATIUSDT',
-    'MEWUSDT',
-    'BOMEUSDT',
-  ];
   const upper = symbol.toUpperCase();
-  if (memeCoinsWith1000Bybit.includes(upper)) {
+  if (MEME_COINS_WITH_1000_PREFIX.includes(upper)) {
     return `1000${upper}`;
   }
   return upper;
 }
 
 function getBinanceSymbol(symbol: string): string {
-  const memeCoinsWith1000Binance = [
-    'PEPEUSDT',
-    'BONKUSDT',
-    'FLOKIUSDT',
-    'BRETTUSDT',
-    'TURBOUSDT',
-    'HMSTRUSDT',
-    'CATIUSDT',
-    'MEWUSDT',
-    'BOMEUSDT',
-  ];
   const upper = symbol.toUpperCase();
-  if (memeCoinsWith1000Binance.includes(upper)) {
+  if (BINANCE_MEME_COINS_WITH_1000_PREFIX.includes(upper)) {
     return `1000${upper}`;
   }
   return upper;
@@ -415,27 +407,20 @@ async function getCachedKlines1D(symbol: string): Promise<any> {
   }
 
   try {
-    const bybitSymbol = getBybitSymbol(symbol);
-    const response = await fetch(
-      `https://api.bybit.com/v5/market/kline?category=linear&symbol=${bybitSymbol}&interval=D&limit=250`
+    const binanceSymbol = getBinanceSymbol(symbol);
+    const klines = await fetchBinanceWithRetry(
+      `https://fapi.binance.com/fapi/v1/klines?symbol=${binanceSymbol}&interval=1d&limit=250`
     );
-    if (!response.ok) throw new Error(`Bybit API error: ${response.status}`);
 
-    const data = await response.json();
-    const klines = data.result?.list || [];
-    
-    // Bybit returns newest first (descending). Reverse to oldest first (ascending) to match Binance and allow indicator calculations.
-    klines.reverse();
-    
     const formatted = klines.map((k: any) => [
-      k[0], // openTime (string/number)
-      k[1], // open (string)
-      k[2], // high (string)
-      k[3], // low (string)
-      k[4], // close (string)
-      k[5], // volume (string)
-      parseInt(k[0]) + 24 * 60 * 60 * 1000, // closeTime
-      k[6], // turnover
+      k[0], // openTime
+      k[1], // open
+      k[2], // high
+      k[3], // low
+      k[4], // close
+      k[5], // volume
+      k[6], // closeTime
+      k[7], // turnover
       '0', '0', '0', '0'
     ]);
 
@@ -455,17 +440,10 @@ async function getCachedKlines4H(symbol: string): Promise<any> {
   }
 
   try {
-    const bybitSymbol = getBybitSymbol(symbol);
-    const response = await fetch(
-      `https://api.bybit.com/v5/market/kline?category=linear&symbol=${bybitSymbol}&interval=240&limit=250`
+    const binanceSymbol = getBinanceSymbol(symbol);
+    const klines = await fetchBinanceWithRetry(
+      `https://fapi.binance.com/fapi/v1/klines?symbol=${binanceSymbol}&interval=4h&limit=250`
     );
-    if (!response.ok) throw new Error(`Bybit API error: ${response.status}`);
-
-    const data = await response.json();
-    const klines = data.result?.list || [];
-
-    // Bybit returns newest first (descending). Reverse to oldest first (ascending) to match Binance and allow indicator calculations.
-    klines.reverse();
 
     const formatted = klines.map((k: any) => [
       k[0], // openTime
@@ -474,8 +452,8 @@ async function getCachedKlines4H(symbol: string): Promise<any> {
       k[3], // low
       k[4], // close
       k[5], // volume
-      parseInt(k[0]) + 4 * 60 * 60 * 1000, // closeTime
-      k[6], // turnover
+      k[6], // closeTime
+      k[7], // turnover
       '0', '0', '0', '0'
     ]);
 
@@ -603,7 +581,8 @@ async function getProbabilityScore(direction: string, trendAlign: boolean, volum
       .get();
     let finishedSignals = querySnapshot.docs
       .map(d => d.data() as Signal)
-      .filter(s => s.outcome === 'WIN' || s.outcome === 'LOSS');
+      .filter(s => s.outcome === 'WIN' || s.outcome === 'LOSS')
+      .filter(s => !(s as any).isSeeded && !s.id.startsWith('seeded_'));
 
     if (volumeSpikeOK) {
       const settings = await getSettings();
@@ -728,8 +707,9 @@ async function seedDatabaseIfEmpty() {
         regimeId,
         regimeLabel,
         regimeStable: true,
-        narrative: `Seeded signal. Aliran ${direction === 'LONG' ? 'BULLISH' : 'BEARISH'} kuat dikesan dengan sokongan volume yang melonjak tinggi.`
-      };
+        narrative: `Seeded signal. Aliran ${direction === 'LONG' ? 'BULLISH' : 'BEARISH'} kuat dikesan dengan sokongan volume yang melonjak tinggi.`,
+        isSeeded: true
+      } as any;
 
       await db.collection('signals_history').doc(mockSignal.id).set(mockSignal);
     }
@@ -810,25 +790,56 @@ async function updatePendingSignals() {
 
         // Auto expire after 4 hours (16 candles of 15M) if still pending
         const ageMs = now - signal.timestamp;
+        let isExpiredResolution = false;
         if (outcome === 'PENDING' && ageMs >= 4 * 60 * 60 * 1000) {
           const lastKline = klines[klines.length - 1];
           const lastClose = parseFloat(lastKline[4]);
+          const slDist = Math.abs(signal.entryPrice - signal.stopLoss);
           
-          if (signal.direction === 'LONG') {
-            outcome = lastClose >= signal.entryPrice ? 'WIN' : 'LOSS';
-          } else {
-            outcome = lastClose <= signal.entryPrice ? 'WIN' : 'LOSS';
+          let realizedR = 0;
+          if (slDist > 0) {
+            if (signal.direction === 'LONG') {
+              realizedR = (lastClose - signal.entryPrice) / slDist;
+            } else {
+              realizedR = (signal.entryPrice - lastClose) / slDist;
+            }
           }
+          
+          outcome = realizedR >= 0.5 ? 'WIN' : 'LOSS';
           outcomeTime = parseInt(lastKline[6]);
+          isExpiredResolution = true;
         }
 
         if (outcome !== 'PENDING') {
+          let realizedR = 0;
+          const slDist = Math.abs(signal.entryPrice - signal.stopLoss);
+          if (outcome === 'LOSS') {
+            realizedR = -1.0;
+          } else if (outcome === 'WIN') {
+            if (isExpiredResolution) {
+              const lastKline = klines[klines.length - 1];
+              const lastClose = parseFloat(lastKline[4]);
+              if (slDist > 0) {
+                realizedR = signal.direction === 'LONG' 
+                  ? (lastClose - signal.entryPrice) / slDist 
+                  : (signal.entryPrice - lastClose) / slDist;
+              } else {
+                realizedR = 0.5;
+              }
+            } else {
+              // Hit target profit 1 inside the loop
+              const tpDist = Math.abs(signal.takeProfit1 - signal.entryPrice);
+              realizedR = slDist > 0 ? tpDist / slDist : 2.5;
+            }
+          }
+
           await db.collection('signals_history').doc(signalId).update({
             outcome,
             outcomeTimestamp: outcomeTime,
+            realizedR: parseFloat(realizedR.toFixed(4))
           });
           hasChanges = true;
-          console.log(`[Outcome Tracker] Resolved Signal ${signalId} (${signal.coin}) -> ${outcome}`);
+          console.log(`[Outcome Tracker] Resolved Signal ${signalId} (${signal.coin}) -> ${outcome} with Realized R: ${realizedR.toFixed(4)}`);
         }
       } catch (err) {
         console.error(`[Outcome Tracker] Error checking signal ${signalId}:`, err);
@@ -875,7 +886,14 @@ async function runMarketScan(): Promise<Signal[]> {
     }
   }
 
-  console.log(`[Market Scan] Scanning universe of ${universe.length} fixed trade pairs (Skipping ${nonExistentSymbols.size} invalid symbols).`);
+  // Sort universe by 24h quote volume descending to prioritize high-volume liquid pairs
+  universe.sort((a, b) => parseFloat(b.quoteVolume || '0') - parseFloat(a.quoteVolume || '0'));
+
+  // Limit scanning universe to user's universeSize setting
+  const targetSize = settings.universeSize || 50;
+  const slicedUniverse = universe.slice(0, targetSize);
+
+  console.log(`[Market Scan] Scanning universe of ${slicedUniverse.length} sorted, highly liquid pairs (Sliced from ${universe.length} total pairs, target size was ${targetSize}, skipped ${nonExistentSymbols.size} invalid).`);
 
   // Fetch Funding rates lookup map (Premium Index)
   const premiumIndexRes = await fetch('https://fapi.binance.com/fapi/v1/premiumIndex');
@@ -900,8 +918,8 @@ async function runMarketScan(): Promise<Signal[]> {
 
   // Use batchSize of 5 and inter-batch delay to stay robust against rate-limits
   const batchSize = 5;
-  for (let idx = 0; idx < universe.length; idx += batchSize) {
-    const batch = universe.slice(idx, idx + batchSize);
+  for (let idx = 0; idx < slicedUniverse.length; idx += batchSize) {
+    const batch = slicedUniverse.slice(idx, idx + batchSize);
     
     await Promise.all(
       batch.map(async coinTicker => {
@@ -958,6 +976,32 @@ async function runMarketScan(): Promise<Signal[]> {
 
           // Calculate spread and fetch order book depth early
           const spread = ((askPrice - bidPrice) / bidPrice) * 100;
+          if (spread > 0.15) {
+            countSpread++;
+            console.log(`[DEBUG-SERVER] REJECT ${symbol} early: spread (${spread.toFixed(3)}%) melebihi had 0.15%`);
+            simulationRecords.push({
+              coin: symbol,
+              regimeId: 5,
+              regimeLabel: 'WAIT — NO TRADE',
+              stable: false,
+              trend1D: 'NEUTRAL',
+              trend4H: 'NEUTRAL',
+              rsi15M: m15RsiLast,
+              rsi4H: 50,
+              volumeSpike,
+              spread,
+              bidAskRatio: 1.0,
+              cvdDelta10: 0,
+              cvdAlign: false,
+              fundingRate: 0,
+              score: 0,
+              rr: 0,
+              status: 'REJECTED',
+              rejectReason: `Sela spread bid-ask terlalu lebar (${spread.toFixed(3)}% > 0.15%)`
+            });
+            return;
+          }
+
           let bidAskRatio = 1.0;
           try {
             const depth = await fetchBinanceWithRetry(`https://fapi.binance.com/fapi/v1/depth?symbol=${binanceSymbol}&limit=20`);
@@ -1463,6 +1507,9 @@ async function runMarketScan(): Promise<Signal[]> {
           let finalScore = 0;
           let breakdown = { trend: 0, momentum: 0, volume: 0, probability: 0, liquidity: 0 };
 
+          // Compute probability score ONCE for this symbol & direction to avoid duplicate query load
+          const probInfo = await getProbabilityScore(direction, true, volumeSpike >= settings.minVolumeSpike, settings.minSampleSize);
+
           if (regimeEval.id === 4) {
             // SPECIFIC SCORING FOR RANGE REGIME
             const distMid = Math.abs(currentPrice - regimeEval.midpoint);
@@ -1519,8 +1566,7 @@ async function runMarketScan(): Promise<Signal[]> {
             if (cvdAlign) volumeScore += 10;
 
             // 4. Probability Score (15 pts)
-            const prob = await getProbabilityScore(direction, true, volumeSpike >= settings.minVolumeSpike, settings.minSampleSize);
-            const probabilityScore = prob.score;
+            const probabilityScore = probInfo.score;
 
             // 5. Liquidity Score (10 pts)
             let liquidityScore = 0;
@@ -1555,8 +1601,6 @@ async function runMarketScan(): Promise<Signal[]> {
             openInterestChange,
           };
 
-          const probInfo = await getProbabilityScore(direction, true, volumeSpike >= settings.minVolumeSpike, settings.minSampleSize);
-
           const signalData: Signal = {
             id: `${symbol}_${direction}_${Date.now()}`,
             coin: symbol,
@@ -1579,6 +1623,38 @@ async function runMarketScan(): Promise<Signal[]> {
           };
 
           if (finalScore >= settings.minScore) {
+            // Critical #2: Signal Deduplication check
+            const pendingSnapshot = await db.collection('signals_history')
+              .where('coin', '==', symbol)
+              .where('direction', '==', direction)
+              .where('outcome', '==', 'PENDING')
+              .get();
+
+            if (!pendingSnapshot.empty) {
+              console.log(`[Market Scan] Suppressed duplicate PENDING signal for ${symbol} ${direction}`);
+              simulationRecords.push({
+                coin: symbol,
+                regimeId: regimeEval.id,
+                regimeLabel: regimeEval.label,
+                stable: regimeEval.stable,
+                trend1D: regimeEval.trend1D,
+                trend4H: regimeEval.trend4H,
+                rsi15M: m15RsiLast,
+                rsi4H: h4RsiLast,
+                volumeSpike,
+                spread,
+                bidAskRatio,
+                cvdDelta10,
+                cvdAlign,
+                fundingRate,
+                score: finalScore,
+                rr: computedRR,
+                status: 'REJECTED',
+                rejectReason: `Deduplication: Isyarat PENDING sedia ada untuk ${symbol} ${direction} sudah aktif.`
+              });
+              return;
+            }
+
             const validation = SignalSchema.safeParse({
               coin: signalData.coin,
               direction: signalData.direction,
@@ -1672,15 +1748,8 @@ async function runMarketScan(): Promise<Signal[]> {
   // Rank by Score descending
   validSignals.sort((a, b) => b.score - a.score);
 
-  // Run AI Debate Layer on candidates
-  try {
-    await runAIDebateLayer(validSignals, db);
-  } catch (debateErr) {
-    console.error('[Market Scan] AI Debate Layer error:', debateErr);
-  }
-
   // Generate Gemini Narratives for Top 3 A+ signals (Must Follow, score >= 90)
-  const topAPlus = validSignals.filter(s => s.score >= 90 && !s.noTrade && !(s as any).disputedByDebate).slice(0, 3);
+  const topAPlus = validSignals.filter(s => s.score >= 90 && !s.noTrade).slice(0, 3);
   for (const sig of topAPlus) {
     sig.narrative = await generateNarrative(sig.coin, sig.direction, sig.metrics);
   }
@@ -1848,7 +1917,20 @@ app.get('/api/settings', async (req, res) => {
 // POST Settings Update
 app.post('/api/settings', async (req, res) => {
   try {
-    const newSettings = req.body as AppSettings;
+    // 1. Authenticate using admin token
+    const token = req.headers['x-auth-token'];
+    const expectedToken = process.env.ADMIN_AUTH_TOKEN || 'scalper_secret_token_2026';
+    if (!token || token !== expectedToken) {
+      return res.status(401).json({ error: 'Tidak sah / Unauthorized. Sila masukkan token pentadbir yang betul.' });
+    }
+
+    // 2. Validate using AppSettingsSchema
+    const validationResult = AppSettingsSchema.safeParse(req.body);
+    if (!validationResult.success) {
+      return res.status(400).json({ error: 'Tetapan tidak sah / Invalid settings: ' + validationResult.error.message });
+    }
+
+    const newSettings = validationResult.data;
     await db.collection('settings').doc('global').set(newSettings);
     clearCaches();
     res.json({ success: true, settings: newSettings });

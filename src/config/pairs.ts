@@ -12,3 +12,19 @@ export const FIXED_TRADE_PAIRS = [
   "QTUMUSDT", "COMPUSDT", "SNXUSDT", "YFIUSDT", "LDOUSDT", "SUSHIUSDT", "CAKEUSDT", "DUSKUSDT", "WLDUSDT", "EGLDUSDT",
   "MINAUSDT"
 ];
+
+// Unified source of truth for 1000x multiplier meme coins across Bybit and Binance
+export const MEME_COINS_WITH_1000_PREFIX = [
+  'PEPEUSDT',
+  'BONKUSDT',
+  'FLOKIUSDT',
+  'BRETTUSDT',
+  'TURBOUSDT',
+  'MEMEUSDT',
+  'POPCATUSDT',
+  'HMSTRUSDT',
+  'CATIUSDT',
+  'MEWUSDT',
+  'BOMEUSDT',
+];
+

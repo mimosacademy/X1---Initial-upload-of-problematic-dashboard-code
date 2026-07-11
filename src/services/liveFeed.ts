@@ -1,5 +1,5 @@
 import WebSocket from 'ws';
-import { FIXED_TRADE_PAIRS } from '../config/pairs.js';
+import { FIXED_TRADE_PAIRS, MEME_COINS_WITH_1000_PREFIX } from '../config/pairs.js';
 
 export interface LivePriceData {
   symbol: string;
@@ -17,21 +17,8 @@ let proactiveReconnectTimeout: NodeJS.Timeout | null = null;
 let isShuttingDown = false;
 
 export function getBybitSymbol(symbol: string): string {
-  const memeCoinsWith1000Bybit = [
-    'PEPEUSDT',
-    'BONKUSDT',
-    'FLOKIUSDT',
-    'BRETTUSDT',
-    'TURBOUSDT',
-    'MEMEUSDT',
-    'POPCATUSDT',
-    'HMSTRUSDT',
-    'CATIUSDT',
-    'MEWUSDT',
-    'BOMEUSDT',
-  ];
   const upper = symbol.toUpperCase();
-  if (memeCoinsWith1000Bybit.includes(upper)) {
+  if (MEME_COINS_WITH_1000_PREFIX.includes(upper)) {
     return `1000${upper}`;
   }
   return upper;
